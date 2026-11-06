@@ -71,7 +71,8 @@ final class WispSpeechSession {
                     text.withCString { cstr in self.callback(self.ctx, cstr, result.isFinal) }
                 }
             } catch {
-                "".withCString { cstr in self.callback(self.ctx, cstr, true) }
+                FileHandle.standardError.write(
+                    Data("wisp-applespeech: analyzer session failed: \(error)\n".utf8))
             }
         }
     }

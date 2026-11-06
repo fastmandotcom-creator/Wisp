@@ -87,6 +87,27 @@ impl EnergySegmenter {
 }
 
 impl Segmenter for EnergySegmenter {
+    /// Continuous playback (a video, a meeting) often never pauses for the hangover, so a
+    /// final-only segmenter emits nothing for minutes. Expose the open utterance so the capture
+    /// loop can decode a partial every few hundred milliseconds.
+    fn partial(&self) -> Option<Utterance> {
+        // 100 ms at 16 kHz — shorter than that is not worth a decode.
+        const MIN_SAMPLES: usize = 1_600;
+        // Trailing window only. Cloning a multi-minute buffer every partial would stall the capture thread.
+        const TAIL_SAMPLES: usize = 12_000; // 0.75s — one decode must finish before the speaker moves on
+        let n = self.utterance.len();
+        if n < MIN_SAMPLES {
+            return None;
+        }
+        let from = n.saturating_sub(TAIL_SAMPLES);
+        let start = self.utterance_start.unwrap_or(Duration::ZERO)
+            + Duration::from_secs_f64(from as f64 / 16_000.0);
+        Some(Utterance {
+            audio: self.utterance[from..].to_vec(),
+            start,
+        })
+    }
+
     fn push(
         &mut self,
         mono: &[f32],
@@ -99,6 +120,12 @@ impl Segmenter for EnergySegmenter {
             }
             self.utterance.extend_from_slice(mono);
             self.silence_accum = Duration::ZERO;
+            // Live captions must commit on a clock, not only on silence. A meeting that never
+            // pauses otherwise becomes one giant utterance the engine decodes long after it was said.
+            const MAX_UTTERANCE_SAMPLES: usize = 3 * 16_000;
+            if self.utterance.len() >= MAX_UTTERANCE_SAMPLES {
+                return self.take().into_iter().collect();
+            }
             return Vec::new();
         }
 
@@ -221,4 +248,16 @@ mod tests {
         seg.push(&silence(0).0, Duration::ZERO, FRAME);
         assert!(seg.flush().is_empty());
     }
+
+    #[test]
+    fn partial_exposes_an_open_utterance_before_silence_closes_it() {
+        let mut seg = segmenter();
+        let speech = vec![0.2_f32; 3_200]; // 200 ms, above the 100 ms floor
+        assert!(seg.push(&speech, Duration::ZERO, FRAME).is_empty());
+        let snap = seg.partial().expect("open utterance must be visible before the hangover");
+        assert!(snap.audio.len() >= 1_600);
+        // Still open: a following silence shorter than the hangover must not be required.
+        assert!(seg.push(&vec![0.0; 160], FRAME, FRAME).is_empty());
+    }
+
 }

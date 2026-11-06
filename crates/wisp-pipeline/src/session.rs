@@ -150,11 +150,14 @@ impl Session {
                     batch.push(next);
                 }
                 let (finals, partials) = coalesce(batch);
+                // Live: follow the speaker. A slow engine must not spend the next minute decoding
+                // sentences that already passed. On stop, keep the flushed finals (the recording's end).
+                let (finals, partials) = if stop_for_transcribe.load(Ordering::Relaxed) {
+                    (finals, Vec::new())
+                } else {
+                    select_live(finals, partials)
+                };
 
-                // Finals are the authoritative transcript — always transcribe them, even on stop. The
-                // capture threads flush their trailing utterance as a Final on stop; dropping it (and
-                // any backlog of real finals a slow engine fell behind on) would silently lose the
-                // last sentence(s) of the recording.
                 for (id, kind, utterance) in finals {
                     match transcriber.transcribe_utterance(
                         id,
@@ -506,6 +509,28 @@ fn coalesce(batch: Vec<Job>) -> (Vec<Decode>, Vec<Decode>) {
     (finals, partials)
 }
 
+/// Live-caption selection: at most the newest final and the newest partial.
+/// A newer open partial suppresses older finals — decoding those would show speech that already passed.
+fn select_live(finals: Vec<Decode>, partials: Vec<Decode>) -> (Vec<Decode>, Vec<Decode>) {
+    let n_final = finals.len();
+    let n_partial = partials.len();
+    let newest_partial = partials.into_iter().max_by_key(|(id, _, _)| *id);
+    let newest_final = finals.into_iter().max_by_key(|(id, _, _)| *id);
+    let (keep_final, keep_partial, out) = match (newest_final, newest_partial) {
+        (Some(fin), Some(par)) if fin.0 < par.0 => (false, true, (Vec::new(), vec![par])),
+        (Some(fin), Some(_)) => (true, false, (vec![fin], Vec::new())),
+        (Some(fin), None) => (true, false, (vec![fin], Vec::new())),
+        (None, Some(par)) => (false, true, (Vec::new(), vec![par])),
+        (None, None) => (false, false, (Vec::new(), Vec::new())),
+    };
+    let dropped = n_final.saturating_sub(usize::from(keep_final))
+        + n_partial.saturating_sub(usize::from(keep_partial));
+    if dropped > 0 {
+        eprintln!("wisp: live caption dropped {dropped} stale job(s) to follow the speaker");
+    }
+    out
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -688,9 +713,9 @@ mod tests {
     }
 
     #[test]
-    fn spawn_live_transcribes_all_queued_utterances_in_order() {
-        // Two utterances separated by trailing silence; the decoupled path must transcribe both,
-        // in order, with sequential ids — even though the engine runs on a separate thread.
+    fn spawn_live_follows_the_speaker_instead_of_catching_up() {
+        // Two utterances land in the queue before the engine runs. Live captions keep the newest
+        // and drop the one that already passed — catching up would show speech the listener missed.
         let frames = vec![
             frame(0.5, 0),
             frame(0.5, 100),
@@ -723,7 +748,16 @@ mod tests {
                 _ => panic!("unexpected event"),
             })
             .collect();
-        assert_eq!(segments, vec![(0, "one".to_owned()), (1, "two".to_owned())]);
+        // The engine may keep up (both, in order) or fall behind (only the newest). It must never
+        // show an old utterance without the newer one — that is the catch-up bug.
+        assert!(
+            segments.iter().any(|(id, _)| *id == 1),
+            "the newest utterance must be transcribed, got {segments:?}"
+        );
+        if segments.len() == 2 {
+            assert_eq!(segments[0].0, 0);
+            assert_eq!(segments[1].0, 1);
+        }
     }
 
     #[test]
@@ -1079,6 +1113,34 @@ mod tests {
             audio: vec![0.1; len],
             start: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn select_live_drops_old_finals_when_the_speaker_has_moved_on() {
+        let (finals, partials) = select_live(
+            vec![
+                (0, AudioSourceKind::System, utt(3)),
+                (1, AudioSourceKind::System, utt(3)),
+            ],
+            vec![(2, AudioSourceKind::System, utt(1))],
+        );
+        assert!(finals.is_empty(), "old sentences must not delay the live line");
+        assert_eq!(partials.len(), 1);
+        assert_eq!(partials[0].0, 2);
+    }
+
+    #[test]
+    fn select_live_keeps_only_the_newest_final_when_the_speaker_paused() {
+        let (finals, partials) = select_live(
+            vec![
+                (0, AudioSourceKind::System, utt(3)),
+                (4, AudioSourceKind::System, utt(3)),
+            ],
+            vec![],
+        );
+        assert!(partials.is_empty());
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].0, 4);
     }
 
     #[test]
